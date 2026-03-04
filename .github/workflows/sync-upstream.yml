@@ -1,0 +1,71 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 2 AM UTC daily
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Get upstream repo
+        id: upstream
+        run: |
+          PARENT=$(gh api "repos/${{ github.repository }}" --jq '.parent.full_name // empty')
+          if [ -z "$PARENT" ]; then
+            echo "This repository does not appear to be a fork. Skipping sync."
+          fi
+          echo "repo=$PARENT" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/checkout@v4
+        if: steps.upstream.outputs.repo != ''
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for upstream changes
+        if: steps.upstream.outputs.repo != ''
+        id: check
+        run: |
+          git remote add upstream "https://github.com/${{ steps.upstream.outputs.repo }}.git"
+          git fetch upstream main
+          BEHIND=$(git rev-list HEAD..upstream/main --count)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "Fork is already up to date with upstream."
+          else
+            echo "Fork is $BEHIND commit(s) behind upstream."
+          fi
+
+      - name: Create sync PR and enable auto-merge
+        if: steps.upstream.outputs.repo != '' && steps.check.outputs.behind != '0'
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d)"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create branch from upstream/main and push
+          git checkout -b "$BRANCH" upstream/main
+          git push origin "$BRANCH"
+
+          # Open the PR (skip if one already exists for this branch)
+          PR_URL=$(gh pr create \
+            --title "chore: sync with upstream $(date +%Y-%m-%d)" \
+            --body "Automated nightly sync with upstream repository [**${{ steps.upstream.outputs.repo }}**](https://github.com/${{ steps.upstream.outputs.repo }})." \
+            --base main \
+            --head "$BRANCH" 2>&1) || true
+
+          echo "$PR_URL"
+
+          # Enable auto-merge so the PR merges once checks pass (skips on conflicts)
+          gh pr merge "$BRANCH" --auto --merge || echo "Auto-merge could not be enabled — check the workflow logs (possible causes: merge conflicts, missing required status checks, or branch protection rules)."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
